@@ -2,7 +2,7 @@
 -- Universal meter-aware release helper with a cached GC perfect-value lock.
 
 local SCRIPT_NAME = "Matcha Auto Shot"
-local SCRIPT_VERSION = "2.0.0"
+local SCRIPT_VERSION = "2.1.0"
 
 assert(type(UI) == "table" and type(UI.AddTab) == "function", "Matcha UI binding is unavailable")
 assert(type(notify) == "function", "Matcha notify() is unavailable")
@@ -55,12 +55,14 @@ local state = {
     busy = false,
     lastTriggerDown = false,
     lastShotDown = false,
+    lastControllerDown = false,
     controllerHook = false,
     shots = 0,
     meterShots = 0,
     gcMatches = 0,
     gcCache = nil,
     gcValues = {},
+    forcedObjects = 0,
     lastHoldMs = 0,
     lastMethod = "none",
     status = "Ready. Perfect mode uses the meter first, then the timer fallback.",
@@ -214,6 +216,16 @@ local function meterNameScore(name)
     return score
 end
 
+local function isForceFillName(name)
+    local lowered = string.lower(tostring(name or ""))
+    if string.find(lowered, "fill", 1, true) then return true end
+    if string.find(lowered, "meter", 1, true) then return true end
+    if string.find(lowered, "progress", 1, true) then return true end
+    if string.find(lowered, "shot", 1, true) and string.find(lowered, "bar", 1, true) then return true end
+    if string.find(lowered, "shot", 1, true) and string.find(lowered, "power", 1, true) then return true end
+    return false
+end
+
 local function readGuiSample(object)
     local visible = safeGet(object, "Visible")
     if visible == false then return nil end
@@ -290,6 +302,7 @@ local function refreshMeterObjects(tracker, now)
                             last = sample,
                             name = tostring(name),
                             nameScore = nameScore,
+                            forceable = isForceFillName(name),
                             changed = false,
                         }
                     end
@@ -297,6 +310,43 @@ local function refreshMeterObjects(tracker, now)
             end
         end
     end
+end
+
+local function forceMeterFull(tracker)
+    if UI.GetValue("mas_force_fill") ~= true then return 0 end
+
+    local changed = 0
+    for object, record in pairs(tracker.objects) do
+        if record.forceable then
+            local sample = readGuiSample(object)
+            if sample and (sample.xs < 0.995 or sample.ys < 0.995) then
+                local sizeOk = pcall(function()
+                    object.Size = UDim2.new(1, 0, 1, 0)
+                end)
+                if sizeOk then
+                    changed = changed + 1
+                    pcall(function()
+                        object.BackgroundColor3 = Color3.fromRGB(0, 255, 90)
+                    end)
+                    pcall(function()
+                        object.ImageColor3 = Color3.fromRGB(0, 255, 90)
+                    end)
+                end
+            end
+        end
+    end
+    state.forcedObjects = state.forcedObjects + changed
+    return changed
+end
+
+local function isControllerSquareDown()
+    local ok, down = pcall(function()
+        return UserInputService:IsGamepadButtonDown(
+            Enum.UserInputType.Gamepad1,
+            Enum.KeyCode.ButtonX
+        )
+    end)
+    return ok and down == true
 end
 
 local function meterReady(tracker, elapsed, fullThreshold)
@@ -348,7 +398,7 @@ firePerfectShot = function()
     local baseDelay = readNumber("mas_release_delay", 0.98)
     local trimMs = readNumber("mas_trim_ms", 0)
     local pingScale = readNumber("mas_ping_scale", 0)
-    local fullThreshold = readNumber("mas_full_threshold", 0.94)
+    local fullThreshold = readNumber("mas_full_threshold", 1.00)
     local ping = type(GetPingValue) == "function" and GetPingValue() or 0
     local fallbackSeconds = baseDelay + (trimMs / 1000) + ((ping * pingScale) / 100000)
     fallbackSeconds = clamp(fallbackSeconds, 0.35, 1.75)
@@ -380,6 +430,7 @@ firePerfectShot = function()
                     releaseReason = reason or "meter"
                     break
                 end
+                forceMeterFull(tracker)
                 if elapsed >= fallbackSeconds then
                     break
                 end
@@ -417,17 +468,22 @@ task.spawn(function()
         local shotKey = parseVirtualKey(UI.GetValue("mas_shot_key"), 0x45)
         local triggerDown = iskeypressed(triggerKey)
         local shotDown = iskeypressed(shotKey)
+        local controllerDown = isControllerSquareDown()
         local enabled = UI.GetValue("mas_enabled") == true
         local directInput = UI.GetValue("mas_direct_input") == true
 
         local separateTrigger = triggerDown and not state.lastTriggerDown
         local directShotTrigger = directInput and shotDown and not state.lastShotDown
-        if enabled and (separateTrigger or directShotTrigger) and not state.busy and isrbxactive() then
+        local controllerTrigger = UI.GetValue("mas_controller_trigger") == true
+            and controllerDown and not state.lastControllerDown
+        if enabled and (separateTrigger or directShotTrigger or controllerTrigger)
+            and not state.busy and isrbxactive() then
             task.spawn(firePerfectShot)
         end
 
         state.lastTriggerDown = triggerDown
         state.lastShotDown = shotDown
+        state.lastControllerDown = controllerDown
         task.wait(0.005)
     end
 end)
@@ -455,6 +511,7 @@ UI.AddTab("Auto Shot", function(tab)
     controls:Toggle("mas_enabled", "Enable auto shot", true)
     controls:Toggle("mas_direct_input", "React to game shoot key", true)
     controls:Toggle("mas_controller_trigger", "Square / ButtonX trigger", true)
+    controls:Toggle("mas_force_fill", "Force meter to 100% green", true)
     controls:InputText("mas_trigger_key", "Trigger VK", "0x46")
     controls:InputText("mas_shot_key", "Game shoot VK", "0x45")
     controls:Combo("mas_input_mode", "Shot input", {
@@ -467,7 +524,7 @@ UI.AddTab("Auto Shot", function(tab)
         "Live meter only",
         "Fixed timer fallback only",
     }, 1)
-    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 0.94, "%.2f")
+    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 1.00, "%.2f")
     controls:SliderFloat("mas_release_delay", "Fallback delay", 0.70, 1.50, 0.98, "%.3f s")
     controls:SliderInt("mas_trim_ms", "Fallback trim", -200, 200, 0)
     controls:SliderFloat("mas_ping_scale", "Ping adjustment", -1, 1, 0, "%.2f")
@@ -486,6 +543,7 @@ UI.AddTab("Auto Shot", function(tab)
     status:Text("Shots: " .. tostring(state.shots))
     status:Text("Meter releases: " .. tostring(state.meterShots))
     status:Text("GC matches: " .. tostring(state.gcMatches))
+    status:Text("Forced meter writes: " .. tostring(state.forcedObjects))
     status:Text("Controller hook: " .. (state.controllerHook and "ready" or "unavailable"))
     status:Text("Last hold: " .. tostring(state.lastHoldMs) .. " ms")
     status:Text("Last method: " .. state.lastMethod)
@@ -500,6 +558,7 @@ UI.AddTab("Auto Shot", function(tab)
             .. " | Ping=" .. tostring(type(GetPingValue) == "function" and GetPingValue() or "n/a")
             .. " | Strategy=" .. tostring(UI.GetValue("mas_strategy") or 1)
             .. " | GCMatches=" .. tostring(state.gcMatches)
+            .. " | ForcedWrites=" .. tostring(state.forcedObjects)
             .. " | LastMethod=" .. state.lastMethod
             .. " | LastHoldMs=" .. tostring(state.lastHoldMs)
             .. " | KnownValues=" .. tostring(countEntries(state.gcValues))
