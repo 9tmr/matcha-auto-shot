@@ -2,7 +2,7 @@
 -- Universal meter-aware release helper with a cached GC perfect-value lock.
 
 local SCRIPT_NAME = "Matcha Auto Shot"
-local SCRIPT_VERSION = "2.2.0"
+local SCRIPT_VERSION = "2.3.0"
 
 assert(type(UI) == "table" and type(UI.AddTab) == "function", "Matcha UI binding is unavailable")
 assert(type(notify) == "function", "Matcha notify() is unavailable")
@@ -63,8 +63,10 @@ local state = {
     gcCache = nil,
     gcValues = {},
     forcedObjects = 0,
+    inputGateActive = false,
     lastHoldMs = 0,
     lastMethod = "none",
+    lastSource = "none",
     status = "Ready. Perfect mode uses the meter first, then the timer fallback.",
 }
 
@@ -74,6 +76,7 @@ if type(previousState) == "table" then
     previousState.active = false
 end
 rawset(environment, "__MATCHA_AUTO_SHOT_STATE", state)
+pcall(setrobloxinput, true)
 
 local function clamp(value, minimum, maximum)
     if value < minimum then return minimum end
@@ -255,6 +258,10 @@ local function readGuiSample(object)
             yo = tonumber(size.Y.Offset) or 0,
             aw = absoluteSize and tonumber(absoluteSize.X) or 0,
             ah = absoluteSize and tonumber(absoluteSize.Y) or 0,
+            ax = (safeGet(object, "AbsolutePosition") and tonumber(safeGet(safeGet(object, "AbsolutePosition"), "X"))) or 0,
+            ay = (safeGet(object, "AbsolutePosition") and tonumber(safeGet(safeGet(object, "AbsolutePosition"), "Y"))) or 0,
+            pw = (safeGet(safeGet(object, "Parent"), "AbsoluteSize") and tonumber(safeGet(safeGet(safeGet(object, "Parent"), "AbsoluteSize"), "X"))) or 0,
+            ph = (safeGet(safeGet(object, "Parent"), "AbsoluteSize") and tonumber(safeGet(safeGet(safeGet(object, "Parent"), "AbsoluteSize"), "Y"))) or 0,
         }
     end)
     if not ok then return nil end
@@ -276,8 +283,33 @@ local function sampleDelta(first, current)
         math.abs(current.xs - first.xs),
         math.abs(current.ys - first.ys),
         math.abs(current.xo - first.xo) / 300,
-        math.abs(current.yo - first.yo) / 300
+        math.abs(current.yo - first.yo) / 300,
+        math.abs(current.ax - first.ax) / 300,
+        math.abs(current.ay - first.ay) / 300
     )
+end
+
+local function meterProgress(record, sample)
+    local first = record.first
+    local xDelta = math.max(
+        math.abs(sample.xs - first.xs),
+        math.abs(sample.xo - first.xo) / 300,
+        math.abs(sample.aw - first.aw) / 300
+    )
+    local yDelta = math.max(
+        math.abs(sample.ys - first.ys),
+        math.abs(sample.yo - first.yo) / 300,
+        math.abs(sample.ah - first.ah) / 300
+    )
+
+    if xDelta >= yDelta then
+        if sample.xs > 0.001 then return sample.xs, xDelta end
+        if sample.pw > 0 then return sample.aw / sample.pw, xDelta end
+    else
+        if sample.ys > 0.001 then return sample.ys, yDelta end
+        if sample.ph > 0 then return sample.ah / sample.ph, yDelta end
+    end
+    return 0, math.max(xDelta, yDelta)
 end
 
 local function beginMeterTracking()
@@ -383,22 +415,28 @@ local function isControllerSquareDown()
     return ok and down == true
 end
 
-local function meterReady(tracker, elapsed, fullThreshold, minimumHold)
+local function meterReady(tracker, elapsed, fullThreshold, armDelay)
     refreshMeterObjects(tracker, tick())
 
     local ready = false
     local reason = nil
     local winningScore = 0
+    local samples = {}
+    local greenZones = {}
+
     for object, record in pairs(tracker.objects) do
         local sample = readGuiSample(object)
         if sample then
+            samples[object] = sample
+            if sample.green and sample.aw > 1 and sample.ah > 1 then
+                greenZones[#greenZones + 1] = {object = object, sample = sample}
+            end
             local delta = sampleDelta(record.first, sample)
             if delta >= 0.015 then record.changed = true end
 
-            local directFull = record.changed and (
-                sample.xs >= fullThreshold or sample.ys >= fullThreshold
-            )
-            local changedGreen = record.changed and sample.green and not record.first.green
+            local progress, axisDelta = meterProgress(record, sample)
+            local directFull = axisDelta >= 0.015 and progress >= fullThreshold
+            local changedGreen = record.changed and sample.green
             local score = record.nameScore + (record.changed and 8 or 0) + (sample.green and 8 or 0)
 
             if score > tracker.bestScore then
@@ -406,7 +444,7 @@ local function meterReady(tracker, elapsed, fullThreshold, minimumHold)
                 tracker.bestName = record.name
             end
 
-            if elapsed >= minimumHold and (changedGreen or directFull) and score > winningScore then
+            if elapsed >= armDelay and (changedGreen or directFull) and score > winningScore then
                 ready = true
                 winningScore = score
                 if changedGreen then
@@ -418,11 +456,66 @@ local function meterReady(tracker, elapsed, fullThreshold, minimumHold)
             record.last = sample
         end
     end
+
+    if elapsed >= armDelay and not ready then
+        for object, record in pairs(tracker.objects) do
+            local sample = samples[object]
+            if sample and not sample.green then
+                local moved = math.max(
+                    math.abs(sample.ax - record.first.ax),
+                    math.abs(sample.ay - record.first.ay)
+                )
+                if moved >= 2 then
+                    local centerX = sample.ax + sample.aw / 2
+                    local centerY = sample.ay + sample.ah / 2
+                    for _, zone in ipairs(greenZones) do
+                        if zone.object ~= object then
+                            local green = zone.sample
+                            if centerX >= green.ax and centerX <= green.ax + green.aw
+                                and centerY >= green.ay and centerY <= green.ay + green.ah then
+                                ready = true
+                                reason = "green-zone contact: " .. record.name
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            if ready then break end
+        end
+    end
     return ready, reason
 end
 
+local function sourceStillDown(source, triggerKey, shotKey)
+    if source == "controller" then return isControllerSquareDown() end
+    if source == "shoot-key" then return iskeypressed(shotKey) end
+    if source == "trigger-key" then return iskeypressed(triggerKey) end
+    return false
+end
+
+local function releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
+    -- Send the release first, then stop a physically-held E/Square from
+    -- immediately reasserting the shot until the player lets that input go.
+    for _ = 1, 3 do
+        pcall(releaseShot, mode, shotKey)
+        task.wait(0.006)
+    end
+
+    if source ~= "shoot-key" and source ~= "controller" then return end
+
+    state.inputGateActive = true
+    pcall(setrobloxinput, false)
+    local deadline = tick() + readNumber("mas_gate_timeout", 3.00)
+    while state.active and sourceStillDown(source, triggerKey, shotKey) and tick() < deadline do
+        task.wait(0.008)
+    end
+    pcall(setrobloxinput, true)
+    state.inputGateActive = false
+end
+
 local firePerfectShot
-firePerfectShot = function()
+firePerfectShot = function(source)
     if state.busy then return end
     state.busy = true
 
@@ -430,14 +523,14 @@ firePerfectShot = function()
     local strategy = tonumber(UI.GetValue("mas_strategy")) or 1
     local shotKey = parseVirtualKey(UI.GetValue("mas_shot_key"), 0x45)
     local baseDelay = readNumber("mas_release_delay", 1.15)
-    local minimumHold = readNumber("mas_minimum_hold", 0.90)
+    local armDelay = readNumber("mas_arm_delay", 0.10)
     local trimMs = readNumber("mas_trim_ms", 0)
     local pingScale = readNumber("mas_ping_scale", 0)
     local fullThreshold = readNumber("mas_full_threshold", 1.00)
     local ping = type(GetPingValue) == "function" and GetPingValue() or 0
     local fallbackSeconds = baseDelay + (trimMs / 1000) + ((ping * pingScale) / 100000)
-    minimumHold = clamp(minimumHold, 0.35, 1.40)
-    fallbackSeconds = clamp(fallbackSeconds, minimumHold + 0.05, 1.75)
+    armDelay = clamp(armDelay, 0.04, 0.40)
+    fallbackSeconds = clamp(fallbackSeconds, armDelay + 0.10, 1.75)
 
     if strategy == 1 and state.gcCache == nil then
         rebuildPerfectCache(false)
@@ -447,6 +540,8 @@ firePerfectShot = function()
     local startedAt = tick()
     local releaseReason = "timer fallback"
     local pressed = false
+    source = tostring(source or "manual")
+    state.lastSource = source
 
     state.status = "Charging shot; watching for full/green meter..."
     local ok, problem = pcall(function()
@@ -461,12 +556,11 @@ firePerfectShot = function()
                 local elapsed = tick() - startedAt
                 if strategy == 1 then applyPerfectLock() end
 
-                local ready, reason = meterReady(tracker, elapsed, fullThreshold, minimumHold)
+                local ready, reason = meterReady(tracker, elapsed, fullThreshold, armDelay)
                 if ready then
                     releaseReason = reason or "meter"
                     break
                 end
-                forceMeterFull(tracker)
                 if elapsed >= fallbackSeconds then
                     break
                 end
@@ -475,7 +569,11 @@ firePerfectShot = function()
         end
 
         if strategy == 1 then applyPerfectLock() end
-        releaseShot(mode, shotKey)
+        -- Seal the visible meter at full green only at the actual release
+        -- point. It can no longer create a false early-ready signal.
+        forceMeterFull(tracker)
+        local triggerKey = parseVirtualKey(UI.GetValue("mas_trigger_key"), 0x46)
+        releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
         pressed = false
     end)
 
@@ -514,7 +612,10 @@ task.spawn(function()
             and controllerDown and not state.lastControllerDown
         if enabled and (separateTrigger or directShotTrigger or controllerTrigger)
             and not state.busy and isrbxactive() then
-            task.spawn(firePerfectShot)
+            local source = separateTrigger and "trigger-key"
+                or (directShotTrigger and "shoot-key")
+                or "controller"
+            task.spawn(function() firePerfectShot(source) end)
         end
 
         state.lastTriggerDown = triggerDown
@@ -535,7 +636,7 @@ local function connectControllerTrigger()
             local keyCode = safeGet(input, "KeyCode")
             local keyName = keyCode and safeGet(keyCode, "Name") or nil
             if keyName == "ButtonX" then
-                task.spawn(firePerfectShot)
+                task.spawn(function() firePerfectShot("controller") end)
             end
         end)
     end)
@@ -560,18 +661,19 @@ UI.AddTab("Auto Shot", function(tab)
         "Live meter only",
         "Fixed timer fallback only",
     }, 1)
-    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 1.00, "%.2f")
-    controls:SliderFloat("mas_minimum_hold", "Minimum charge time", 0.40, 1.40, 0.90, "%.3f s")
+    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 0.97, "%.2f")
+    controls:SliderFloat("mas_arm_delay", "Meter arming delay", 0.04, 0.40, 0.10, "%.3f s")
     controls:SliderFloat("mas_release_delay", "Maximum hold timeout", 0.70, 1.70, 1.15, "%.3f s")
+    controls:SliderFloat("mas_gate_timeout", "Held-input block timeout", 0.50, 5.00, 3.00, "%.2f s")
     controls:SliderInt("mas_trim_ms", "Fallback trim", -200, 200, 0)
     controls:SliderFloat("mas_ping_scale", "Ping adjustment", -1, 1, 0, "%.2f")
     controls:Button("Take one perfect shot", function()
-        if not state.busy then task.spawn(firePerfectShot) end
+        if not state.busy then task.spawn(function() firePerfectShot("manual") end) end
     end)
     controls:Button("Rescan perfect values", function()
         rebuildPerfectCache(true)
     end)
-    controls:Tip("F, E, or Square/ButtonX starts a held E charge. It cannot release before Minimum charge time, preventing the early pump fake shown in the recording.")
+    controls:Tip("Tap or hold F, E, or Square/ButtonX. The script owns the charge, releases at the live green/full point, and blocks a still-held E/Square until you let go.")
 
     local status = tab:Section("Live Status", "Right")
     status:Text("Version: " .. SCRIPT_VERSION)
@@ -584,8 +686,11 @@ UI.AddTab("Auto Shot", function(tab)
     status:Text("Controller hook: " .. (state.controllerHook and "ready" or "unavailable"))
     status:Text("Last hold: " .. tostring(state.lastHoldMs) .. " ms")
     status:Text("Last method: " .. state.lastMethod)
+    status:Text("Last input: " .. state.lastSource)
+    status:Text("Held-input gate: " .. (state.inputGateActive and "blocking" or "ready"))
     status:Spacing()
-    status:Text("Minimum charge prevents pump fakes.")
+    status:Text("Live green/full detection releases immediately.")
+    status:Text("Forced green is applied only at the release point.")
     status:Text("The maximum timer is fallback-only.")
     status:Text("Lower Full meter threshold only if release is late.")
     status:Spacing()
@@ -595,10 +700,11 @@ UI.AddTab("Auto Shot", function(tab)
             .. " | Executor=" .. tostring(executorName) .. " " .. tostring(executorVersion)
             .. " | Ping=" .. tostring(type(GetPingValue) == "function" and GetPingValue() or "n/a")
             .. " | Strategy=" .. tostring(UI.GetValue("mas_strategy") or 1)
-            .. " | MinimumHold=" .. tostring(UI.GetValue("mas_minimum_hold") or 0.90)
+            .. " | ArmDelay=" .. tostring(UI.GetValue("mas_arm_delay") or 0.10)
             .. " | GCMatches=" .. tostring(state.gcMatches)
             .. " | ForcedWrites=" .. tostring(state.forcedObjects)
             .. " | LastMethod=" .. state.lastMethod
+            .. " | LastSource=" .. state.lastSource
             .. " | LastHoldMs=" .. tostring(state.lastHoldMs)
             .. " | KnownValues=" .. tostring(countEntries(state.gcValues))
         setclipboard(report)
