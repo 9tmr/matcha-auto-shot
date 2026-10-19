@@ -2,7 +2,7 @@
 -- Universal meter-aware release helper with a cached GC perfect-value lock.
 
 local SCRIPT_NAME = "Matcha Auto Shot"
-local SCRIPT_VERSION = "2.1.0"
+local SCRIPT_VERSION = "2.2.0"
 
 assert(type(UI) == "table" and type(UI.AddTab) == "function", "Matcha UI binding is unavailable")
 assert(type(notify) == "function", "Matcha notify() is unavailable")
@@ -219,11 +219,24 @@ end
 local function isForceFillName(name)
     local lowered = string.lower(tostring(name or ""))
     if string.find(lowered, "fill", 1, true) then return true end
-    if string.find(lowered, "meter", 1, true) then return true end
     if string.find(lowered, "progress", 1, true) then return true end
+    if string.find(lowered, "amount", 1, true) then return true end
+    if string.find(lowered, "value", 1, true) then return true end
     if string.find(lowered, "shot", 1, true) and string.find(lowered, "bar", 1, true) then return true end
     if string.find(lowered, "shot", 1, true) and string.find(lowered, "power", 1, true) then return true end
     return false
+end
+
+local function inheritedMeterScore(object)
+    local cursor = safeGet(object, "Parent")
+    local depth = 0
+    while cursor and depth < 5 do
+        local score = meterNameScore(safeGet(cursor, "Name"))
+        if score >= 4 then return score end
+        cursor = safeGet(cursor, "Parent")
+        depth = depth + 1
+    end
+    return 0
 end
 
 local function readGuiSample(object)
@@ -234,11 +247,14 @@ local function readGuiSample(object)
     if size == nil then return nil end
 
     local ok, sample = pcall(function()
+        local absoluteSize = safeGet(object, "AbsoluteSize")
         return {
             xs = tonumber(size.X.Scale) or 0,
             xo = tonumber(size.X.Offset) or 0,
             ys = tonumber(size.Y.Scale) or 0,
             yo = tonumber(size.Y.Offset) or 0,
+            aw = absoluteSize and tonumber(absoluteSize.X) or 0,
+            ah = absoluteSize and tonumber(absoluteSize.Y) or 0,
         }
     end)
     if not ok then return nil end
@@ -289,20 +305,23 @@ local function refreshMeterObjects(tracker, now)
         if tracker.objects[object] == nil then
             local name = safeGet(object, "Name")
             local nameScore = meterNameScore(name)
-            if nameScore > 0 then
-                local isGui = false
-                pcall(function()
-                    isGui = object:IsA("GuiObject")
-                end)
-                if isGui then
+            local inheritedScore = inheritedMeterScore(object)
+            local isGui = false
+            pcall(function()
+                isGui = object:IsA("GuiObject")
+            end)
+            if isGui and (nameScore > 0 or inheritedScore > 0) then
+                local className = tostring(safeGet(object, "ClassName") or "")
+                local isText = string.find(className, "Text", 1, true) ~= nil
+                if not isText then
                     local sample = readGuiSample(object)
                     if sample then
                         tracker.objects[object] = {
                             first = sample,
                             last = sample,
                             name = tostring(name),
-                            nameScore = nameScore,
-                            forceable = isForceFillName(name),
+                            nameScore = math.max(nameScore, inheritedScore),
+                            forceable = isForceFillName(name) or inheritedScore > 0,
                             changed = false,
                         }
                     end
@@ -319,10 +338,25 @@ local function forceMeterFull(tracker)
     for object, record in pairs(tracker.objects) do
         if record.forceable then
             local sample = readGuiSample(object)
+            local parent = safeGet(object, "Parent")
+            local parentSize = parent and safeGet(parent, "AbsoluteSize") or nil
+            local parentWidth = parentSize and tonumber(safeGet(parentSize, "X")) or 0
+            local parentHeight = parentSize and tonumber(safeGet(parentSize, "Y")) or 0
             if sample and (sample.xs < 0.995 or sample.ys < 0.995) then
-                local sizeOk = pcall(function()
-                    object.Size = UDim2.new(1, 0, 1, 0)
-                end)
+                local sizeOk = false
+                if parentHeight > parentWidth * 1.20 and sample.ah < parentHeight * 0.995 then
+                    sizeOk = pcall(function()
+                        object.Size = UDim2.new(sample.xs, sample.xo, 1, 0)
+                    end)
+                elseif parentWidth > parentHeight * 1.20 and sample.aw < parentWidth * 0.995 then
+                    sizeOk = pcall(function()
+                        object.Size = UDim2.new(1, 0, sample.ys, sample.yo)
+                    end)
+                elseif isForceFillName(record.name) then
+                    sizeOk = pcall(function()
+                        object.Size = UDim2.new(1, 0, 1, 0)
+                    end)
+                end
                 if sizeOk then
                     changed = changed + 1
                     pcall(function()
@@ -349,7 +383,7 @@ local function isControllerSquareDown()
     return ok and down == true
 end
 
-local function meterReady(tracker, elapsed, fullThreshold)
+local function meterReady(tracker, elapsed, fullThreshold, minimumHold)
     refreshMeterObjects(tracker, tick())
 
     local ready = false
@@ -372,7 +406,7 @@ local function meterReady(tracker, elapsed, fullThreshold)
                 tracker.bestName = record.name
             end
 
-            if elapsed >= 0.20 and (changedGreen or directFull) and score > winningScore then
+            if elapsed >= minimumHold and (changedGreen or directFull) and score > winningScore then
                 ready = true
                 winningScore = score
                 if changedGreen then
@@ -395,13 +429,15 @@ firePerfectShot = function()
     local mode = tonumber(UI.GetValue("mas_input_mode")) or 1
     local strategy = tonumber(UI.GetValue("mas_strategy")) or 1
     local shotKey = parseVirtualKey(UI.GetValue("mas_shot_key"), 0x45)
-    local baseDelay = readNumber("mas_release_delay", 0.98)
+    local baseDelay = readNumber("mas_release_delay", 1.15)
+    local minimumHold = readNumber("mas_minimum_hold", 0.90)
     local trimMs = readNumber("mas_trim_ms", 0)
     local pingScale = readNumber("mas_ping_scale", 0)
     local fullThreshold = readNumber("mas_full_threshold", 1.00)
     local ping = type(GetPingValue) == "function" and GetPingValue() or 0
     local fallbackSeconds = baseDelay + (trimMs / 1000) + ((ping * pingScale) / 100000)
-    fallbackSeconds = clamp(fallbackSeconds, 0.35, 1.75)
+    minimumHold = clamp(minimumHold, 0.35, 1.40)
+    fallbackSeconds = clamp(fallbackSeconds, minimumHold + 0.05, 1.75)
 
     if strategy == 1 and state.gcCache == nil then
         rebuildPerfectCache(false)
@@ -425,7 +461,7 @@ firePerfectShot = function()
                 local elapsed = tick() - startedAt
                 if strategy == 1 then applyPerfectLock() end
 
-                local ready, reason = meterReady(tracker, elapsed, fullThreshold)
+                local ready, reason = meterReady(tracker, elapsed, fullThreshold, minimumHold)
                 if ready then
                     releaseReason = reason or "meter"
                     break
@@ -525,7 +561,8 @@ UI.AddTab("Auto Shot", function(tab)
         "Fixed timer fallback only",
     }, 1)
     controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 1.00, "%.2f")
-    controls:SliderFloat("mas_release_delay", "Fallback delay", 0.70, 1.50, 0.98, "%.3f s")
+    controls:SliderFloat("mas_minimum_hold", "Minimum charge time", 0.40, 1.40, 0.90, "%.3f s")
+    controls:SliderFloat("mas_release_delay", "Maximum hold timeout", 0.70, 1.70, 1.15, "%.3f s")
     controls:SliderInt("mas_trim_ms", "Fallback trim", -200, 200, 0)
     controls:SliderFloat("mas_ping_scale", "Ping adjustment", -1, 1, 0, "%.2f")
     controls:Button("Take one perfect shot", function()
@@ -534,7 +571,7 @@ UI.AddTab("Auto Shot", function(tab)
     controls:Button("Rescan perfect values", function()
         rebuildPerfectCache(true)
     end)
-    controls:Tip("F, E, or a quick Square/ButtonX tap triggers one controlled E hold/release. Perfect mode watches the existing meter while charging.")
+    controls:Tip("F, E, or Square/ButtonX starts a held E charge. It cannot release before Minimum charge time, preventing the early pump fake shown in the recording.")
 
     local status = tab:Section("Live Status", "Right")
     status:Text("Version: " .. SCRIPT_VERSION)
@@ -548,7 +585,8 @@ UI.AddTab("Auto Shot", function(tab)
     status:Text("Last hold: " .. tostring(state.lastHoldMs) .. " ms")
     status:Text("Last method: " .. state.lastMethod)
     status:Spacing()
-    status:Text("The timer is now fallback-only.")
+    status:Text("Minimum charge prevents pump fakes.")
+    status:Text("The maximum timer is fallback-only.")
     status:Text("Lower Full meter threshold only if release is late.")
     status:Spacing()
     status:Button("Copy diagnostics", function()
@@ -557,6 +595,7 @@ UI.AddTab("Auto Shot", function(tab)
             .. " | Executor=" .. tostring(executorName) .. " " .. tostring(executorVersion)
             .. " | Ping=" .. tostring(type(GetPingValue) == "function" and GetPingValue() or "n/a")
             .. " | Strategy=" .. tostring(UI.GetValue("mas_strategy") or 1)
+            .. " | MinimumHold=" .. tostring(UI.GetValue("mas_minimum_hold") or 0.90)
             .. " | GCMatches=" .. tostring(state.gcMatches)
             .. " | ForcedWrites=" .. tostring(state.forcedObjects)
             .. " | LastMethod=" .. state.lastMethod
