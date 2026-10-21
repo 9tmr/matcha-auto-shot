@@ -2,7 +2,8 @@
 -- Universal meter-aware release helper with a cached GC perfect-value lock.
 
 local SCRIPT_NAME = "Matcha Auto Shot"
-local SCRIPT_VERSION = "3.0.0"
+local SCRIPT_VERSION = "3.1.0"
+local CONTROLLER_SQUARE_VK = 0xC3
 
 assert(type(UI) == "table" and type(UI.AddTab) == "function", "Matcha UI binding is unavailable")
 assert(type(notify) == "function", "Matcha notify() is unavailable")
@@ -101,7 +102,7 @@ local state = {
     lastMethod = "none",
     lastSource = "none",
     lastMeterRoot = "none",
-    status = "Ready. Perfect mode uses the meter first, then the timer fallback.",
+    status = "Ready. Press E or Square once; release timing is automatic.",
 }
 
 local environment = getfenv()
@@ -675,15 +676,33 @@ local function sourceStillDown(source, triggerKey, shotKey)
     return false
 end
 
+local function releaseSourceInput(mode, shotKey, source)
+    -- End both the controlled shot key and the controller's Square/ButtonX
+    -- path so either physical trigger reaches the same automatic key-up.
+    if source == "controller" then
+        pcall(keyrelease, CONTROLLER_SQUARE_VK)
+        pcall(keyrelease, shotKey)
+    else
+        pcall(releaseShot, mode, shotKey)
+    end
+end
+
 local function releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
     -- Pulse every release path at the green point. The GC takeover clears
     -- common held/charging flags so a physical Square hold cannot keep the
     -- game's internal charge state alive after the injected E is released.
     local releasedAt = tick()
     for _ = 1, 6 do
+        -- Release pulses must be sent while Roblox input is enabled. v3.0
+        -- disabled input first, which also suppressed its own key-up pulses.
+        pcall(setrobloxinput, true)
         applyReleaseTakeover()
-        pcall(releaseShot, mode, shotKey)
-        task.wait(0.008)
+        releaseSourceInput(mode, shotKey, source)
+        task.wait(0.004)
+        if source == "shoot-key" or source == "controller" then
+            pcall(setrobloxinput, false)
+        end
+        task.wait(0.004)
     end
 
     if source ~= "shoot-key" and source ~= "controller" then return releasedAt end
@@ -692,14 +711,19 @@ local function releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
     pcall(setrobloxinput, false)
     local deadline = tick() + readNumber("mas_gate_timeout", 5.00)
     while state.active and sourceStillDown(source, triggerKey, shotKey) and tick() < deadline do
+        -- Briefly open the gate for an explicit key-up, then close it before
+        -- the continuing hardware hold can reclaim the charge state.
+        pcall(setrobloxinput, true)
         applyReleaseTakeover()
-        pcall(releaseShot, mode, shotKey)
-        task.wait(0.012)
+        releaseSourceInput(mode, shotKey, source)
+        task.wait(0.004)
+        pcall(setrobloxinput, false)
+        task.wait(0.008)
     end
     pcall(setrobloxinput, true)
     for _ = 1, 3 do
         applyReleaseTakeover()
-        pcall(releaseShot, mode, shotKey)
+        releaseSourceInput(mode, shotKey, source)
         task.wait(0.006)
     end
     state.inputGateActive = false
@@ -714,17 +738,16 @@ firePerfectShot = function(source)
     local mode = tonumber(UI.GetValue("mas_input_mode")) or 1
     local strategy = tonumber(UI.GetValue("mas_strategy")) or 1
     local shotKey = parseVirtualKey(UI.GetValue("mas_shot_key"), 0x45)
-    local baseDelay = readNumber("mas_release_delay", 0.90)
-    local meterTimeout = readNumber("mas_meter_timeout", 0.44)
+    local autoDeadline = readNumber("mas_meter_timeout", 0.44)
     local armDelay = readNumber("mas_arm_delay", 0.06)
     local trimMs = readNumber("mas_trim_ms", 0)
     local pingScale = readNumber("mas_ping_scale", 0)
     local fullThreshold = readNumber("mas_full_threshold", 0.96)
     local ping = type(GetPingValue) == "function" and GetPingValue() or 0
-    local fallbackSeconds = baseDelay + (trimMs / 1000) + ((ping * pingScale) / 100000)
+    local releaseDeadline = autoDeadline + (trimMs / 1000) + ((ping * pingScale) / 100000)
     armDelay = clamp(armDelay, 0.03, 0.25)
-    meterTimeout = clamp(meterTimeout, 0.20, 0.90)
-    fallbackSeconds = clamp(fallbackSeconds, meterTimeout + 0.10, 1.40)
+    autoDeadline = clamp(autoDeadline, 0.20, 0.90)
+    releaseDeadline = clamp(releaseDeadline, 0.20, 0.90)
 
     if strategy == 1 and state.gcCache == nil then
         rebuildPerfectCache(false)
@@ -732,27 +755,22 @@ firePerfectShot = function(source)
 
     local tracker = beginMeterTracking()
     local startedAt = tick()
-    local releaseReason = "no-meter safety timeout"
-    local pressed = false
+    local releaseReason = "automatic calibrated release"
+    local controlledPress = false
     local releasedAt = nil
     source = tostring(source or "manual")
     state.lastSource = source
 
     state.status = "Charging shot; watching for full/green meter..."
     local ok, problem = pcall(function()
-        setrobloxinput(true)
-        if source == "controller" then
-            -- Clear any stale hold left by the physical Square InputBegan,
-            -- then let the controlled keyboard shot own the charge cycle.
-            applyReleaseTakeover()
-            pcall(releaseShot, mode, shotKey)
-            task.wait(0.012)
-        end
+        pcall(setrobloxinput, true)
+        -- Own the charge after the E/Square edge so a quick tap and a long
+        -- hold follow the same automatic release cycle.
         pressShot(mode, shotKey)
-        pressed = true
+        controlledPress = true
 
         if strategy == 3 then
-            sleepPrecisely(fallbackSeconds)
+            sleepPrecisely(releaseDeadline)
         else
             while true do
                 local elapsed = tick() - startedAt
@@ -763,13 +781,16 @@ firePerfectShot = function(source)
                     elapsed,
                     fullThreshold,
                     armDelay,
-                    meterTimeout
+                    autoDeadline
                 )
                 if ready then
                     releaseReason = reason or "meter"
                     break
                 end
-                if elapsed >= fallbackSeconds then
+                -- This is an absolute deadline, not a fallback that waits for
+                -- the player to release. If Matcha cannot see the world meter,
+                -- the video-calibrated release still happens automatically.
+                if elapsed >= releaseDeadline then
                     break
                 end
                 task.wait(0.004)
@@ -782,17 +803,17 @@ firePerfectShot = function(source)
         forceMeterFull(tracker)
         local triggerKey = parseVirtualKey(UI.GetValue("mas_trigger_key"), 0x46)
         releasedAt = releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
-        pressed = false
+        controlledPress = false
     end)
 
-    if pressed then pcall(releaseShot, mode, shotKey) end
+    if controlledPress then releaseSourceInput(mode, shotKey, source) end
 
     if ok then
         state.shots = state.shots + 1
         state.lastHoldMs = math.floor(((releasedAt or tick()) - startedAt) * 1000 + 0.5)
         state.lastMethod = releaseReason
         state.lastMeterRoot = tracker.bestRoot
-        if releaseReason ~= "no-meter safety timeout" then
+        if releaseReason ~= "automatic calibrated release" then
             state.meterShots = state.meterShots + 1
         end
         state.status = "Released at " .. tostring(state.lastHoldMs) .. " ms via " .. releaseReason .. "."
@@ -882,8 +903,7 @@ UI.AddTab("Auto Shot", function(tab)
     }, 1)
     controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 0.96, "%.2f")
     controls:SliderFloat("mas_arm_delay", "Meter arming delay", 0.03, 0.25, 0.06, "%.3f s")
-    controls:SliderFloat("mas_meter_timeout", "World-meter peak timeout", 0.20, 0.90, 0.44, "%.3f s")
-    controls:SliderFloat("mas_release_delay", "No-meter safety timeout", 0.50, 1.40, 0.90, "%.3f s")
+    controls:SliderFloat("mas_meter_timeout", "Automatic release deadline", 0.20, 0.90, 0.44, "%.3f s")
     controls:SliderFloat("mas_gate_timeout", "Held-input block timeout", 0.50, 8.00, 5.00, "%.2f s")
     controls:SliderInt("mas_trim_ms", "Fallback trim", -200, 200, 0)
     controls:SliderFloat("mas_ping_scale", "Ping adjustment", -1, 1, 0, "%.2f")
@@ -893,7 +913,7 @@ UI.AddTab("Auto Shot", function(tab)
     controls:Button("Rescan perfect values", function()
         rebuildPerfectCache(true)
     end)
-    controls:Tip("v3 scans PlayerGui plus the character's world-space/Billboard meter. Tap or hold E/Square: it releases when the white marker touches the green cap or reverses at the peak, then suppresses the remaining physical hold.")
+    controls:Tip("v3.1 turns E/Square into one automatic shot cycle. Tap or hold: it releases on green/peak when visible and always releases at the calibrated deadline when the meter is hidden.")
 
     local status = tab:Section("Live Status", "Right")
     status:Text("Version: " .. SCRIPT_VERSION)
@@ -914,7 +934,7 @@ UI.AddTab("Auto Shot", function(tab)
     status:Text("Character/Billboard meters are scanned at ~28 Hz.")
     status:Text("Green contact and peak reversal release immediately.")
     status:Text("Forced green is applied only at the release point.")
-    status:Text("World-meter peak timeout backs up hidden markers.")
+    status:Text("The automatic deadline releases hidden meters without player timing.")
     status:Text("Lower Full meter threshold only if release is late.")
     status:Spacing()
     status:Button("Copy diagnostics", function()

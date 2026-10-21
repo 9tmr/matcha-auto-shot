@@ -1,4 +1,25 @@
-# Matcha Auto Shot Meter 3.0
+# Matcha Auto Shot Meter 3.1
+
+## Version 3.1 automatic takeover fix
+
+Version 3.0 waited for the old `0.90`-second safety timeout when the meter was
+not readable. More importantly, it disabled Roblox input before sending its
+repeated key-up pulses. That could suppress the script's own release and leave
+the real held button in control, making the player release manually.
+
+Version 3.1 changes the shot lifecycle:
+
+1. Physical E and Square/ButtonX are start signals; the script owns the charge
+   so a quick tap and a long hold use the same automatic cycle.
+2. A visible green contact or marker reversal still releases immediately.
+3. An absolute video-calibrated `0.44`-second deadline releases every shot even
+   when Matcha cannot inspect the meter.
+4. E receives repeated key-up pulses. Square also receives the Windows
+   `VK_GAMEPAD_X` (`0xC3`) release pulse while the cached held/charging GC state
+   is cleared.
+5. Release pulses are sent while input is enabled, then the gate is closed
+   between pulses. The physical hold cannot silently suppress the scripted
+   key-up or reclaim the charge.
 
 Version 3.0 is a major meter and input-state overhaul based on the supplied `20261021-0043-43.9894260.mp4` recording.
 
@@ -31,8 +52,7 @@ Reloading the script disables the older copy automatically.
 
 - Full meter threshold: `0.96`
 - Meter arming delay: `0.06` seconds
-- World-meter peak timeout: `0.44` seconds
-- No-meter safety timeout: `0.90` seconds
+- Automatic release deadline: `0.44` seconds
 - Held-input block timeout: `5.00` seconds
 
 The live green/contact and peak-reversal signals take priority over every timer.
@@ -46,7 +66,7 @@ After a shot, check **Last method** and **Last meter root**:
 - `green meter: ...` — a tracked meter object changed to green.
 - `full meter: ...` — a changing fill reached the configured threshold.
 - `calibrated world-meter peak` — the world meter moved, but its internal marker was not individually exposed.
-- `no-meter safety timeout` — no usable meter activity was visible to Matcha.
+- `automatic calibrated release` — the meter was hidden, so the script released at the absolute automatic deadline.
 
 `Last meter root` should normally report `Character/Billboard` for the game in the supplied recording. **Release takeover matches** reports how many common held/charging client values were found.
 
