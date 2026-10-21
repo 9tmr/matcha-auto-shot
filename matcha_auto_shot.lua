@@ -2,7 +2,7 @@
 -- Universal meter-aware release helper with a cached GC perfect-value lock.
 
 local SCRIPT_NAME = "Matcha Auto Shot"
-local SCRIPT_VERSION = "2.3.0"
+local SCRIPT_VERSION = "3.0.0"
 
 assert(type(UI) == "table" and type(UI.AddTab) == "function", "Matcha UI binding is unavailable")
 assert(type(notify) == "function", "Matcha notify() is unavailable")
@@ -50,23 +50,57 @@ local PERCENT_KEYS = {
     ReleasePercent = true,
 }
 
+local RELEASE_KEYS = {
+    "Holding",
+    "IsHolding",
+    "Shooting",
+    "IsShooting",
+    "Charging",
+    "IsCharging",
+    "ShotHeld",
+    "ShootHeld",
+    "HoldingShot",
+    "HoldingShoot",
+    "ShotButtonDown",
+    "ShootButtonDown",
+    "InputDown",
+    "IsInputDown",
+    "ButtonHeld",
+    "Released",
+    "HasReleased",
+    "ShotReleased",
+    "ReleaseShot",
+}
+
+local RELEASE_TRUE_KEYS = {
+    Released = true,
+    HasReleased = true,
+    ShotReleased = true,
+    ReleaseShot = true,
+}
+
 local state = {
     active = true,
     busy = false,
     lastTriggerDown = false,
     lastShotDown = false,
     lastControllerDown = false,
+    controllerHeld = false,
     controllerHook = false,
     shots = 0,
     meterShots = 0,
     gcMatches = 0,
     gcCache = nil,
     gcValues = {},
+    releaseGcCache = nil,
+    releaseGcValues = {},
+    releaseGcMatches = 0,
     forcedObjects = 0,
     inputGateActive = false,
     lastHoldMs = 0,
     lastMethod = "none",
     lastSource = "none",
+    lastMeterRoot = "none",
     status = "Ready. Perfect mode uses the meter first, then the timer fallback.",
 }
 
@@ -152,6 +186,8 @@ local function rebuildPerfectCache(showNotice)
     if type(getgc) ~= "function" or type(applygc) ~= "function" then
         state.gcCache = nil
         state.gcMatches = 0
+        state.releaseGcCache = nil
+        state.releaseGcMatches = 0
         state.status = "GC lock unavailable; meter tracking is still active."
         if showNotice then notify(state.status, SCRIPT_NAME, 5) end
         return false
@@ -188,8 +224,28 @@ local function rebuildPerfectCache(showNotice)
     state.gcCache = cache
     state.gcValues = values
     state.gcMatches = matches
+
+    local releaseCache = nil
+    local releaseValues = {}
+    local releaseMatches = 0
+    local releaseOk, releaseResult = pcall(getgc, RELEASE_KEYS)
+    if releaseOk and type(releaseResult) == "table" then
+        releaseCache = releaseResult
+        for _, entry in ipairs(releaseResult) do
+            local key = type(entry) == "table" and entry.key or nil
+            if type(key) == "string" then
+                releaseMatches = releaseMatches + 1
+                releaseValues[key] = RELEASE_TRUE_KEYS[key] == true
+            end
+        end
+    end
+    state.releaseGcCache = releaseCache
+    state.releaseGcValues = releaseValues
+    state.releaseGcMatches = releaseMatches
+
     if matches > 0 then
-        state.status = "Perfect lock found " .. tostring(matches) .. " client value(s)."
+        state.status = "Perfect lock found " .. tostring(matches)
+            .. " value(s); release takeover found " .. tostring(releaseMatches) .. "."
     else
         state.status = "No known perfect values found; using live meter tracking."
     end
@@ -200,6 +256,13 @@ end
 local function applyPerfectLock()
     if not state.gcCache or state.gcMatches < 1 then return 0 end
     local ok, changed = pcall(applygc, state.gcCache, state.gcValues)
+    if ok then return tonumber(changed) or 0 end
+    return 0
+end
+
+local function applyReleaseTakeover()
+    if not state.releaseGcCache or state.releaseGcMatches < 1 then return 0 end
+    local ok, changed = pcall(applygc, state.releaseGcCache, state.releaseGcValues)
     if ok then return tonumber(changed) or 0 end
     return 0
 end
@@ -251,6 +314,10 @@ local function readGuiSample(object)
 
     local ok, sample = pcall(function()
         local absoluteSize = safeGet(object, "AbsoluteSize")
+        local absolutePosition = safeGet(object, "AbsolutePosition")
+        local position = safeGet(object, "Position")
+        local parent = safeGet(object, "Parent")
+        local parentSize = safeGet(parent, "AbsoluteSize")
         return {
             xs = tonumber(size.X.Scale) or 0,
             xo = tonumber(size.X.Offset) or 0,
@@ -258,10 +325,14 @@ local function readGuiSample(object)
             yo = tonumber(size.Y.Offset) or 0,
             aw = absoluteSize and tonumber(absoluteSize.X) or 0,
             ah = absoluteSize and tonumber(absoluteSize.Y) or 0,
-            ax = (safeGet(object, "AbsolutePosition") and tonumber(safeGet(safeGet(object, "AbsolutePosition"), "X"))) or 0,
-            ay = (safeGet(object, "AbsolutePosition") and tonumber(safeGet(safeGet(object, "AbsolutePosition"), "Y"))) or 0,
-            pw = (safeGet(safeGet(object, "Parent"), "AbsoluteSize") and tonumber(safeGet(safeGet(safeGet(object, "Parent"), "AbsoluteSize"), "X"))) or 0,
-            ph = (safeGet(safeGet(object, "Parent"), "AbsoluteSize") and tonumber(safeGet(safeGet(safeGet(object, "Parent"), "AbsoluteSize"), "Y"))) or 0,
+            ax = absolutePosition and tonumber(absolutePosition.X) or 0,
+            ay = absolutePosition and tonumber(absolutePosition.Y) or 0,
+            psx = position and tonumber(position.X.Scale) or 0,
+            pox = position and tonumber(position.X.Offset) or 0,
+            psy = position and tonumber(position.Y.Scale) or 0,
+            poy = position and tonumber(position.Y.Offset) or 0,
+            pw = parentSize and tonumber(parentSize.X) or 0,
+            ph = parentSize and tonumber(parentSize.Y) or 0,
         }
     end)
     if not ok then return nil end
@@ -278,14 +349,22 @@ local function readGuiSample(object)
     return sample
 end
 
+local function localPosition(sample)
+    return sample.psx * sample.pw + sample.pox, sample.psy * sample.ph + sample.poy
+end
+
+local function localPositionDelta(first, current)
+    local firstX, firstY = localPosition(first)
+    local currentX, currentY = localPosition(current)
+    return math.abs(currentX - firstX), math.abs(currentY - firstY), currentX, currentY
+end
+
 local function sampleDelta(first, current)
     return math.max(
         math.abs(current.xs - first.xs),
         math.abs(current.ys - first.ys),
         math.abs(current.xo - first.xo) / 300,
-        math.abs(current.yo - first.yo) / 300,
-        math.abs(current.ax - first.ax) / 300,
-        math.abs(current.ay - first.ay) / 300
+        math.abs(current.yo - first.yo) / 300
     )
 end
 
@@ -316,51 +395,113 @@ local function beginMeterTracking()
     return {
         objects = {},
         bestName = "none",
+        bestRoot = "none",
         bestScore = 0,
         lastScan = 0,
+        startedAt = tick(),
+        firstSeenAt = nil,
+        activitySeenAt = nil,
+        workspaceScanned = false,
     }
 end
 
+local function addMeterObject(tracker, object, rootName, allowGeneric)
+    if tracker.objects[object] ~= nil then return end
+
+    local name = safeGet(object, "Name")
+    local nameScore = meterNameScore(name)
+    local inheritedScore = inheritedMeterScore(object)
+    local isGui = false
+    pcall(function()
+        isGui = object:IsA("GuiObject")
+    end)
+    if not isGui then return end
+
+    local className = tostring(safeGet(object, "ClassName") or "")
+    if string.find(className, "Text", 1, true) ~= nil then return end
+
+    local sample = readGuiSample(object)
+    if not sample then return end
+
+    local compactWorldGui = allowGeneric
+        and sample.aw >= 1 and sample.ah >= 1
+        and sample.aw <= 320 and sample.ah <= 520
+    if nameScore <= 0 and inheritedScore <= 0 and not compactWorldGui then return end
+
+    local localX, localY = localPosition(sample)
+    local score = math.max(nameScore, inheritedScore)
+    if compactWorldGui then score = score + 4 end
+    tracker.objects[object] = {
+        first = sample,
+        last = sample,
+        name = tostring(name),
+        rootName = rootName,
+        nameScore = score,
+        forceable = isForceFillName(name) or inheritedScore >= 6,
+        changed = false,
+        firstLocalX = localX,
+        firstLocalY = localY,
+        lastLocalX = localX,
+        lastLocalY = localY,
+        minLocalY = localY,
+        maxLocalY = localY,
+        riseDistance = 0,
+    }
+    if tracker.firstSeenAt == nil then tracker.firstSeenAt = tick() end
+    if score > tracker.bestScore then
+        tracker.bestScore = score
+        tracker.bestName = tostring(name)
+        tracker.bestRoot = rootName
+    end
+end
+
+local function scanMeterRoot(tracker, root, rootName, allowGeneric)
+    if not root then return end
+    local ok, descendants = pcall(function()
+        return root:GetDescendants()
+    end)
+    if not ok or type(descendants) ~= "table" then return end
+    for _, object in ipairs(descendants) do
+        addMeterObject(tracker, object, rootName, allowGeneric)
+    end
+end
+
 local function refreshMeterObjects(tracker, now)
-    if now - tracker.lastScan < 0.06 then return end
+    if now - tracker.lastScan < 0.035 then return end
     tracker.lastScan = now
 
     local playerGui = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
-    if not playerGui then return end
+    local character = LocalPlayer and safeGet(LocalPlayer, "Character") or nil
+    scanMeterRoot(tracker, playerGui, "PlayerGui", false)
+    scanMeterRoot(tracker, character, "Character/Billboard", true)
 
-    local ok, descendants = pcall(function()
-        return playerGui:GetDescendants()
-    end)
-    if not ok or type(descendants) ~= "table" then return end
-
-    for _, object in ipairs(descendants) do
-        if tracker.objects[object] == nil then
-            local name = safeGet(object, "Name")
-            local nameScore = meterNameScore(name)
-            local inheritedScore = inheritedMeterScore(object)
-            local isGui = false
-            pcall(function()
-                isGui = object:IsA("GuiObject")
-            end)
-            if isGui and (nameScore > 0 or inheritedScore > 0) then
-                local className = tostring(safeGet(object, "ClassName") or "")
-                local isText = string.find(className, "Text", 1, true) ~= nil
-                if not isText then
-                    local sample = readGuiSample(object)
-                    if sample then
-                        tracker.objects[object] = {
-                            first = sample,
-                            last = sample,
-                            name = tostring(name),
-                            nameScore = math.max(nameScore, inheritedScore),
-                            forceable = isForceFillName(name) or inheritedScore > 0,
-                            changed = false,
-                        }
-                    end
-                end
-            end
-        end
+    -- Some games parent a BillboardGui to a temporary Workspace object rather
+    -- than the character. Scan Workspace only once and only if the fast roots
+    -- did not expose any candidates.
+    if tracker.bestScore < 6 and not tracker.workspaceScanned
+        and now - tracker.startedAt >= 0.12 then
+        tracker.workspaceScanned = true
+        scanMeterRoot(tracker, workspace, "Workspace", false)
     end
+end
+
+local function sharesMeterAncestor(firstObject, secondObject)
+    local ancestors = {}
+    local cursor = firstObject
+    local depth = 0
+    while cursor and depth < 5 do
+        ancestors[cursor] = true
+        cursor = safeGet(cursor, "Parent")
+        depth = depth + 1
+    end
+    cursor = secondObject
+    depth = 0
+    while cursor and depth < 5 do
+        if ancestors[cursor] then return true end
+        cursor = safeGet(cursor, "Parent")
+        depth = depth + 1
+    end
+    return false
 end
 
 local function forceMeterFull(tracker)
@@ -412,17 +553,20 @@ local function isControllerSquareDown()
             Enum.KeyCode.ButtonX
         )
     end)
-    return ok and down == true
+    if ok then return down == true end
+    return state.controllerHeld == true
 end
 
-local function meterReady(tracker, elapsed, fullThreshold, armDelay)
-    refreshMeterObjects(tracker, tick())
+local function meterReady(tracker, elapsed, fullThreshold, armDelay, meterTimeout)
+    local now = tick()
+    refreshMeterObjects(tracker, now)
 
     local ready = false
     local reason = nil
     local winningScore = 0
     local samples = {}
     local greenZones = {}
+    local peakCandidate = nil
 
     for object, record in pairs(tracker.objects) do
         local sample = readGuiSample(object)
@@ -431,17 +575,30 @@ local function meterReady(tracker, elapsed, fullThreshold, armDelay)
             if sample.green and sample.aw > 1 and sample.ah > 1 then
                 greenZones[#greenZones + 1] = {object = object, sample = sample}
             end
-            local delta = sampleDelta(record.first, sample)
-            if delta >= 0.015 then record.changed = true end
+            local sizeDelta = sampleDelta(record.first, sample)
+            local colorChanged = record.last and sample.green ~= record.last.green
+            local localMoveX, localMoveY, localX, localY = localPositionDelta(record.first, sample)
+            local localMoved = math.max(localMoveX, localMoveY)
+            if sizeDelta >= 0.015 then record.changed = true end
+            if localMoved >= 1.5 then record.moved = true end
+            if (record.changed or record.moved or colorChanged) and tracker.activitySeenAt == nil then
+                tracker.activitySeenAt = now
+            end
+
+            record.minLocalY = math.min(record.minLocalY, localY)
+            record.maxLocalY = math.max(record.maxLocalY, localY)
+            record.riseDistance = math.max(record.riseDistance, record.firstLocalY - record.minLocalY)
 
             local progress, axisDelta = meterProgress(record, sample)
             local directFull = axisDelta >= 0.015 and progress >= fullThreshold
-            local changedGreen = record.changed and sample.green
-            local score = record.nameScore + (record.changed and 8 or 0) + (sample.green and 8 or 0)
+            local changedGreen = sample.green and not record.first.green and colorChanged
+            local score = record.nameScore + (record.changed and 8 or 0)
+                + (record.moved and 8 or 0) + (sample.green and 8 or 0)
 
             if score > tracker.bestScore then
                 tracker.bestScore = score
                 tracker.bestName = record.name
+                tracker.bestRoot = record.rootName
             end
 
             if elapsed >= armDelay and (changedGreen or directFull) and score > winningScore then
@@ -453,6 +610,18 @@ local function meterReady(tracker, elapsed, fullThreshold, armDelay)
                     reason = "full meter: " .. record.name
                 end
             end
+
+
+            -- The supplied game uses a white marker that rises to a green cap
+            -- and then falls while Square remains held. If the marker reverses
+            -- after a meaningful upward travel, release at the peak instead of
+            -- allowing the bar to drop through the green window.
+            if elapsed >= armDelay and record.riseDistance >= 6
+                and localY >= record.minLocalY + 1.25 then
+                peakCandidate = record
+            end
+            record.lastLocalX = localX
+            record.lastLocalY = localY
             record.last = sample
         end
     end
@@ -461,20 +630,19 @@ local function meterReady(tracker, elapsed, fullThreshold, armDelay)
         for object, record in pairs(tracker.objects) do
             local sample = samples[object]
             if sample and not sample.green then
-                local moved = math.max(
-                    math.abs(sample.ax - record.first.ax),
-                    math.abs(sample.ay - record.first.ay)
-                )
+                local moveX, moveY = localPositionDelta(record.first, sample)
+                local moved = math.max(moveX, moveY)
                 if moved >= 2 then
                     local centerX = sample.ax + sample.aw / 2
                     local centerY = sample.ay + sample.ah / 2
                     for _, zone in ipairs(greenZones) do
-                        if zone.object ~= object then
+                        if zone.object ~= object and sharesMeterAncestor(object, zone.object) then
                             local green = zone.sample
                             if centerX >= green.ax and centerX <= green.ax + green.aw
                                 and centerY >= green.ay and centerY <= green.ay + green.ah then
                                 ready = true
                                 reason = "green-zone contact: " .. record.name
+                                tracker.bestRoot = record.rootName
                                 break
                             end
                         end
@@ -483,6 +651,19 @@ local function meterReady(tracker, elapsed, fullThreshold, armDelay)
             end
             if ready then break end
         end
+    end
+
+
+    if elapsed >= armDelay and not ready and peakCandidate then
+        ready = true
+        reason = "meter peak reversal: " .. peakCandidate.name
+        tracker.bestRoot = peakCandidate.rootName
+    end
+
+    if not ready and tracker.activitySeenAt
+        and now - tracker.activitySeenAt >= meterTimeout then
+        ready = true
+        reason = "calibrated world-meter peak"
     end
     return ready, reason
 end
@@ -495,23 +676,34 @@ local function sourceStillDown(source, triggerKey, shotKey)
 end
 
 local function releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
-    -- Send the release first, then stop a physically-held E/Square from
-    -- immediately reasserting the shot until the player lets that input go.
-    for _ = 1, 3 do
+    -- Pulse every release path at the green point. The GC takeover clears
+    -- common held/charging flags so a physical Square hold cannot keep the
+    -- game's internal charge state alive after the injected E is released.
+    local releasedAt = tick()
+    for _ = 1, 6 do
+        applyReleaseTakeover()
         pcall(releaseShot, mode, shotKey)
-        task.wait(0.006)
+        task.wait(0.008)
     end
 
-    if source ~= "shoot-key" and source ~= "controller" then return end
+    if source ~= "shoot-key" and source ~= "controller" then return releasedAt end
 
     state.inputGateActive = true
     pcall(setrobloxinput, false)
-    local deadline = tick() + readNumber("mas_gate_timeout", 3.00)
+    local deadline = tick() + readNumber("mas_gate_timeout", 5.00)
     while state.active and sourceStillDown(source, triggerKey, shotKey) and tick() < deadline do
-        task.wait(0.008)
+        applyReleaseTakeover()
+        pcall(releaseShot, mode, shotKey)
+        task.wait(0.012)
     end
     pcall(setrobloxinput, true)
+    for _ = 1, 3 do
+        applyReleaseTakeover()
+        pcall(releaseShot, mode, shotKey)
+        task.wait(0.006)
+    end
     state.inputGateActive = false
+    return releasedAt
 end
 
 local firePerfectShot
@@ -522,15 +714,17 @@ firePerfectShot = function(source)
     local mode = tonumber(UI.GetValue("mas_input_mode")) or 1
     local strategy = tonumber(UI.GetValue("mas_strategy")) or 1
     local shotKey = parseVirtualKey(UI.GetValue("mas_shot_key"), 0x45)
-    local baseDelay = readNumber("mas_release_delay", 1.15)
-    local armDelay = readNumber("mas_arm_delay", 0.10)
+    local baseDelay = readNumber("mas_release_delay", 0.90)
+    local meterTimeout = readNumber("mas_meter_timeout", 0.44)
+    local armDelay = readNumber("mas_arm_delay", 0.06)
     local trimMs = readNumber("mas_trim_ms", 0)
     local pingScale = readNumber("mas_ping_scale", 0)
-    local fullThreshold = readNumber("mas_full_threshold", 1.00)
+    local fullThreshold = readNumber("mas_full_threshold", 0.96)
     local ping = type(GetPingValue) == "function" and GetPingValue() or 0
     local fallbackSeconds = baseDelay + (trimMs / 1000) + ((ping * pingScale) / 100000)
-    armDelay = clamp(armDelay, 0.04, 0.40)
-    fallbackSeconds = clamp(fallbackSeconds, armDelay + 0.10, 1.75)
+    armDelay = clamp(armDelay, 0.03, 0.25)
+    meterTimeout = clamp(meterTimeout, 0.20, 0.90)
+    fallbackSeconds = clamp(fallbackSeconds, meterTimeout + 0.10, 1.40)
 
     if strategy == 1 and state.gcCache == nil then
         rebuildPerfectCache(false)
@@ -538,14 +732,22 @@ firePerfectShot = function(source)
 
     local tracker = beginMeterTracking()
     local startedAt = tick()
-    local releaseReason = "timer fallback"
+    local releaseReason = "no-meter safety timeout"
     local pressed = false
+    local releasedAt = nil
     source = tostring(source or "manual")
     state.lastSource = source
 
     state.status = "Charging shot; watching for full/green meter..."
     local ok, problem = pcall(function()
         setrobloxinput(true)
+        if source == "controller" then
+            -- Clear any stale hold left by the physical Square InputBegan,
+            -- then let the controlled keyboard shot own the charge cycle.
+            applyReleaseTakeover()
+            pcall(releaseShot, mode, shotKey)
+            task.wait(0.012)
+        end
         pressShot(mode, shotKey)
         pressed = true
 
@@ -556,7 +758,13 @@ firePerfectShot = function(source)
                 local elapsed = tick() - startedAt
                 if strategy == 1 then applyPerfectLock() end
 
-                local ready, reason = meterReady(tracker, elapsed, fullThreshold, armDelay)
+                local ready, reason = meterReady(
+                    tracker,
+                    elapsed,
+                    fullThreshold,
+                    armDelay,
+                    meterTimeout
+                )
                 if ready then
                     releaseReason = reason or "meter"
                     break
@@ -573,7 +781,7 @@ firePerfectShot = function(source)
         -- point. It can no longer create a false early-ready signal.
         forceMeterFull(tracker)
         local triggerKey = parseVirtualKey(UI.GetValue("mas_trigger_key"), 0x46)
-        releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
+        releasedAt = releaseAndBlockHeldInput(mode, shotKey, source, triggerKey)
         pressed = false
     end)
 
@@ -581,13 +789,16 @@ firePerfectShot = function(source)
 
     if ok then
         state.shots = state.shots + 1
-        state.lastHoldMs = math.floor((tick() - startedAt) * 1000 + 0.5)
+        state.lastHoldMs = math.floor(((releasedAt or tick()) - startedAt) * 1000 + 0.5)
         state.lastMethod = releaseReason
-        if releaseReason ~= "timer fallback" then
+        state.lastMeterRoot = tracker.bestRoot
+        if releaseReason ~= "no-meter safety timeout" then
             state.meterShots = state.meterShots + 1
         end
         state.status = "Released at " .. tostring(state.lastHoldMs) .. " ms via " .. releaseReason .. "."
     else
+        pcall(setrobloxinput, true)
+        state.inputGateActive = false
         state.status = "Input error: " .. tostring(problem)
         notify(state.status, SCRIPT_NAME, 6)
     end
@@ -636,7 +847,15 @@ local function connectControllerTrigger()
             local keyCode = safeGet(input, "KeyCode")
             local keyName = keyCode and safeGet(keyCode, "Name") or nil
             if keyName == "ButtonX" then
+                state.controllerHeld = true
                 task.spawn(function() firePerfectShot("controller") end)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(input)
+            local keyCode = safeGet(input, "KeyCode")
+            local keyName = keyCode and safeGet(keyCode, "Name") or nil
+            if keyName == "ButtonX" then
+                state.controllerHeld = false
             end
         end)
     end)
@@ -661,10 +880,11 @@ UI.AddTab("Auto Shot", function(tab)
         "Live meter only",
         "Fixed timer fallback only",
     }, 1)
-    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 0.97, "%.2f")
-    controls:SliderFloat("mas_arm_delay", "Meter arming delay", 0.04, 0.40, 0.10, "%.3f s")
-    controls:SliderFloat("mas_release_delay", "Maximum hold timeout", 0.70, 1.70, 1.15, "%.3f s")
-    controls:SliderFloat("mas_gate_timeout", "Held-input block timeout", 0.50, 5.00, 3.00, "%.2f s")
+    controls:SliderFloat("mas_full_threshold", "Full meter threshold", 0.80, 1.00, 0.96, "%.2f")
+    controls:SliderFloat("mas_arm_delay", "Meter arming delay", 0.03, 0.25, 0.06, "%.3f s")
+    controls:SliderFloat("mas_meter_timeout", "World-meter peak timeout", 0.20, 0.90, 0.44, "%.3f s")
+    controls:SliderFloat("mas_release_delay", "No-meter safety timeout", 0.50, 1.40, 0.90, "%.3f s")
+    controls:SliderFloat("mas_gate_timeout", "Held-input block timeout", 0.50, 8.00, 5.00, "%.2f s")
     controls:SliderInt("mas_trim_ms", "Fallback trim", -200, 200, 0)
     controls:SliderFloat("mas_ping_scale", "Ping adjustment", -1, 1, 0, "%.2f")
     controls:Button("Take one perfect shot", function()
@@ -673,7 +893,7 @@ UI.AddTab("Auto Shot", function(tab)
     controls:Button("Rescan perfect values", function()
         rebuildPerfectCache(true)
     end)
-    controls:Tip("Tap or hold F, E, or Square/ButtonX. The script owns the charge, releases at the live green/full point, and blocks a still-held E/Square until you let go.")
+    controls:Tip("v3 scans PlayerGui plus the character's world-space/Billboard meter. Tap or hold E/Square: it releases when the white marker touches the green cap or reverses at the peak, then suppresses the remaining physical hold.")
 
     local status = tab:Section("Live Status", "Right")
     status:Text("Version: " .. SCRIPT_VERSION)
@@ -682,16 +902,19 @@ UI.AddTab("Auto Shot", function(tab)
     status:Text("Shots: " .. tostring(state.shots))
     status:Text("Meter releases: " .. tostring(state.meterShots))
     status:Text("GC matches: " .. tostring(state.gcMatches))
+    status:Text("Release takeover matches: " .. tostring(state.releaseGcMatches))
     status:Text("Forced meter writes: " .. tostring(state.forcedObjects))
     status:Text("Controller hook: " .. (state.controllerHook and "ready" or "unavailable"))
     status:Text("Last hold: " .. tostring(state.lastHoldMs) .. " ms")
     status:Text("Last method: " .. state.lastMethod)
     status:Text("Last input: " .. state.lastSource)
+    status:Text("Last meter root: " .. state.lastMeterRoot)
     status:Text("Held-input gate: " .. (state.inputGateActive and "blocking" or "ready"))
     status:Spacing()
-    status:Text("Live green/full detection releases immediately.")
+    status:Text("Character/Billboard meters are scanned at ~28 Hz.")
+    status:Text("Green contact and peak reversal release immediately.")
     status:Text("Forced green is applied only at the release point.")
-    status:Text("The maximum timer is fallback-only.")
+    status:Text("World-meter peak timeout backs up hidden markers.")
     status:Text("Lower Full meter threshold only if release is late.")
     status:Spacing()
     status:Button("Copy diagnostics", function()
@@ -700,11 +923,14 @@ UI.AddTab("Auto Shot", function(tab)
             .. " | Executor=" .. tostring(executorName) .. " " .. tostring(executorVersion)
             .. " | Ping=" .. tostring(type(GetPingValue) == "function" and GetPingValue() or "n/a")
             .. " | Strategy=" .. tostring(UI.GetValue("mas_strategy") or 1)
-            .. " | ArmDelay=" .. tostring(UI.GetValue("mas_arm_delay") or 0.10)
+            .. " | ArmDelay=" .. tostring(UI.GetValue("mas_arm_delay") or 0.06)
+            .. " | MeterTimeout=" .. tostring(UI.GetValue("mas_meter_timeout") or 0.44)
             .. " | GCMatches=" .. tostring(state.gcMatches)
+            .. " | ReleaseMatches=" .. tostring(state.releaseGcMatches)
             .. " | ForcedWrites=" .. tostring(state.forcedObjects)
             .. " | LastMethod=" .. state.lastMethod
             .. " | LastSource=" .. state.lastSource
+            .. " | LastMeterRoot=" .. state.lastMeterRoot
             .. " | LastHoldMs=" .. tostring(state.lastHoldMs)
             .. " | KnownValues=" .. tostring(countEntries(state.gcValues))
         setclipboard(report)

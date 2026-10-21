@@ -1,52 +1,60 @@
-# Matcha Auto Shot Meter 2.3
+# Matcha Auto Shot Meter 3.0
 
-Version 2.3 adds a tap-or-hold shot controller and a held-input release gate:
+Version 3.0 is a major meter and input-state overhaul based on the supplied `20261021-0043-43.9894260.mp4` recording.
 
-1. A single tap or a held E/Square press starts one complete controlled charge.
-2. It watches the game's existing `PlayerGui` for a changing fill dimension, a meter turning green, or a moving needle entering a green zone.
-3. It releases immediately at the detected green/full point. The default threshold is `97%`; the short `0.10`-second arming delay only rejects the meter's initial appearance.
-4. At the release point, it seals matching visible meter descendants to full green so the displayed bar finishes at the top.
-5. If E or Square is still physically held after the release, it temporarily gates Roblox input until that button is lifted, preventing the held button from overriding the automatic release.
-6. A maximum `1.15`-second timer remains as the fallback when a game does not expose a recognizable meter.
+## What the recording showed
 
-The perfect-value layer still scans once for known client-side shot values and uses Matcha's cached `applygc` path while the shot charges. It does not repeatedly run the expensive `getgc` scan.
+The game's shot meter is a world-space/Billboard-style vertical bar beside the character. The white marker rises into the green cap in roughly 0.3–0.5 seconds. When Square stays held, the marker reverses and falls. Version 2.3 scanned only `PlayerGui`, so it missed this world-space meter and waited for the 1.15-second fallback—after the green window had already passed.
 
-Unlike v2.2, v2.3 does **not** force the visual bar full before reading it. That old order could turn the script's own visual write into a false release signal.
+## Version 3.0 behavior
 
-Reloading the script automatically disables the previous copy, so an older timing loop cannot interfere with the updated release logic.
+1. Scans both `PlayerGui` and the local character for world-space/Billboard meter descendants. A single targeted Workspace scan covers games that parent the meter to a temporary world object.
+2. Tracks changing fill dimensions, color changes, and local GUI position rather than treating camera or character movement as meter movement.
+3. Releases as soon as a moving marker touches a related green GUI zone.
+4. Detects the marker's upward peak and releases on the first downward reversal if the green contact is not directly exposed.
+5. Uses a video-calibrated `0.44`-second world-meter timeout as a final backup for meters drawn as one inaccessible image.
+6. Forces recognized fill descendants to full green only at the actual release point, so the script's own visual write cannot cause an early pump fake.
+7. Sends a six-pulse release burst and applies a cached GC release takeover for common held/charging flags.
+8. If E or Square remains physically held, it gates Roblox input and continues pulsing release state until the button is lifted.
+
+Reloading the script disables the older copy automatically.
 
 ## Default controls
 
-- **Auto shot** starts enabled in the **Auto Shot** tab.
-- Press `F` (`0x46`) to perform one controlled shot.
-- Pressing the game's `E` (`0x45`) shoot key also starts the controlled hold/release automatically.
-- A PlayStation Square press is exposed to Roblox as `ButtonX`; a quick Square/ButtonX tap triggers the same controlled `E` release when Matcha exposes the `UserInputService` event.
-- Select Mouse 1 or Mouse 2 if that is the game's actual shooting input.
+- Auto shot starts enabled in the **Auto Shot** tab.
+- Press `F` (`0x46`) for one controlled shot.
+- Press or hold the game's `E` (`0x45`) shoot key.
+- Press or hold PlayStation Square / Roblox `ButtonX` on controller.
+- The default shot output is the configured keyboard shot key (`E`). Mouse 1 and Mouse 2 remain available.
 
-The default strategy is **Perfect lock + live meter**, **Force meter to 100% green** starts enabled, and the live full threshold defaults to `0.97`. The maximum fallback timeout is `1.15` seconds.
+## Default tuning
 
-## Tap, hold, and forced release
+- Full meter threshold: `0.96`
+- Meter arming delay: `0.06` seconds
+- World-meter peak timeout: `0.44` seconds
+- No-meter safety timeout: `0.90` seconds
+- Held-input block timeout: `5.00` seconds
 
-Whether the physical input is tapped or held, the injected shot input remains held until the live meter reaches green/full. The script then sends repeated release events. For direct E and Square/ButtonX shots, it also calls `setrobloxinput(false)` while the same physical input remains down, then restores input as soon as it is released (or after the configurable safety timeout).
-
-This is what allows the automatic release to occur while the player's finger is still holding the button.
+The live green/contact and peak-reversal signals take priority over every timer.
 
 ## Status checks
 
-After a shot, read **Last method**:
+After a shot, check **Last method** and **Last meter root**:
 
-- `green meter: ...` means the meter changed to green and triggered the release.
-- `full meter: ...` means a changing meter reached the full threshold.
-- `green-zone contact: ...` means a moving meter indicator entered a visible green GUI zone.
-- `timer fallback` means the game did not expose a recognizable meter object during that shot.
+- `green-zone contact: ...` — the moving marker entered a green GUI cap.
+- `meter peak reversal: ...` — the marker reached its highest point and started falling.
+- `green meter: ...` — a tracked meter object changed to green.
+- `full meter: ...` — a changing fill reached the configured threshold.
+- `calibrated world-meter peak` — the world meter moved, but its internal marker was not individually exposed.
+- `no-meter safety timeout` — no usable meter activity was visible to Matcha.
 
-Use **Rescan perfect values** after entering a match or changing courts. **GC matches** reports how many known client-side shot fields Matcha found.
+`Last meter root` should normally report `Character/Billboard` for the game in the supplied recording. **Release takeover matches** reports how many common held/charging client values were found.
 
 ## Important limitation
 
-This uses the game's existing GUI objects and client-side Lua values; it does not read screen pixels. If a game hides its meter in an unsupported renderer or validates the final timing only on its server, a client script cannot force every result green. In that case, copy the diagnostics after one failed shot so game-specific keys can be added.
+No client-side executor can guarantee a server-validated result in every game. Version 3.0 aggressively controls the visible meter, injected release, and exposed client state, but a server may independently reject or recalculate a shot. If a shot still fails, use **Copy diagnostics** immediately afterward so the exact release method, meter root, timing, and matched state fields can be inspected.
 
-Matcha's documented input API can inject keyboard and mouse input but not a synthetic controller button. For controller play, Square/ButtonX is detected through both `InputBegan` and `IsGamepadButtonDown`; the script holds the configured keyboard shot input underneath and uses Matcha's Roblox-input gate to stop a still-held Square signal at release.
+Matcha has no documented API for injecting a controller-button release. Controller mode therefore detects Square/ButtonX, drives the configured keyboard shot input, clears exposed held/charging state, and gates the remaining physical hold at the release point.
 
 ## GitHub execution
 
@@ -55,8 +63,6 @@ loadstring(httpget("https://raw.githubusercontent.com/9tmr/matcha-auto-shot/main
 ```
 
 ## Local execution
-
-Place `matcha_auto_shot.lua` in the Matcha workspace and run:
 
 ```lua
 loadstring(readfile("matcha_auto_shot.lua"), "@MatchaAutoShot")()
